@@ -1,0 +1,26 @@
+# ============================================================================
+# dsh-429-monitor —— 插件挂载声明（dsh.bundle.patch）
+#
+# 这个文件让 `install_bundle` / `dsh plugin add` 安装本包时**自动**把插件
+# 挂进 profile 的组合树，无需用户手工编辑 cordis.patch.yml。
+#
+# 只注册 **一行**，这是刻意的：
+#   - 按包名注册时，宿主侧激活 package.json 的 main（lib/index.js），
+#     而 lib/index.js 转出真正的宿主监控实现 host/session-monitor.mjs；
+#   - 浏览器侧由 dsh-client-modules 读取 exports["./client"] 下发 client.js。
+#   一行同时覆盖宿主侧与客户端侧。
+#
+# ⚠️ 切勿再额外加一行指向 host/session-monitor.mjs。同一个包出现两个
+#    active Loader source 时，dsh-client-modules 会抛
+#    ClientPackageCompositionError（"resolves from multiple active Loader sources"），
+#    最坏情况导致整个客户端插件图谱无法组成。
+# ============================================================================
+
+- insert:
+    - id: session-monitor
+      name: dsh-429-monitor
+      config:
+        # 独立仪表盘端口（被占用时自动回退 8091~8100）
+        port: 8091
+        # 是否随监控自动拉起 ON AIR 桌面小窗（仅 Windows）
+        desktopDisplay: false

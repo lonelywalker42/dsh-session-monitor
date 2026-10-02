@@ -1,0 +1,56 @@
+{
+  "name": "dsh-429-monitor",
+  "version": "1.1.0",
+  "description": "会话状态监测 + 429 错误检测 + 自动继续 + ON AIR 桌面件 (DSH 插件，桌面版 / webui 双端)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./client.js",
+    "./host": "./host/session-monitor.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": "^0.2.0-rc.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "cordis-plugin",
+    "deepseek-harness",
+    "deepseek-harness-desktop",
+    "429",
+    "rate-limit",
+    "rate_limit",
+    "monitor",
+    "session-status",
+    "auto-continue"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lonelywalker42/dsh-session-monitor.git"
+  },
+  "files": [
+    "lib",
+    "host",
+    "widget",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ]
+}

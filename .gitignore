@@ -1,0 +1,17 @@
+# Dependencies (本插件无运行时依赖，此处仅为以防万一)
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
