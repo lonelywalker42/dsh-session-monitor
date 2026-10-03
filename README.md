@@ -101,7 +101,7 @@ dsh plugin --profile web add github:lonelywalker42/dsh-session-monitor
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `port` | `8091` | 独立仪表盘端口；被占用或在 Windows 排除段时自动回退 `8091~8100` |
+| `port` | 注册配置 8091；代码兜底 3091 | 独立仪表盘端口；被占用或在 Windows 排除段时自动回退 `8091~8100` |
 | `host` | `127.0.0.1` | 监听地址（环境变量 `SM_HOST`） |
 | `autoRetryDefault` | `false` | 自动继续的初始开关 |
 | `maxRetries` | `3` | 连续自动继续上限 |
@@ -126,16 +126,14 @@ Invoke-RestMethod http://127.0.0.1:8091/api/state
 
 - 表格：状态（彩色圆点）/ 会话标题与 id / 活动时间 / 最近告警 / 自动继续次数 / 操作
 - 操作：`继续`（手动恢复）/ `已读`（工作完成后移除）/ `移除`
-- 左上角「自动继续」开关，持久化到 `%DSH_HOME%\storages\session-monitor\settings.json`
+- 左上角「自动继续」开关，持久化到 `%DSH_HOME%\storages\session-monitor\profiles\profile-<编码profile>\settings.json`
 - 1 秒自动刷新；接口：`/api/state`（JSON）、`/api/events`（SSE）、`/api/settings`（读写）
 
 ### 自动继续
 
 默认**只提醒不自动继续**。在仪表盘打开「自动继续」开关后，插件会在 429 终止时自动发送「继续」。
 
-> **不要同时打开主机侧与客户端侧两个自动继续开关。** 主机侧（仪表盘）与客户端侧
-> （输入栏小窗）各有独立开关、各自去重，双双开启时一次 429 可能触发两条「继续」。
-> 推荐只用主机侧。
+浮窗、设置页、仪表盘和桌面件共享当前宿主的设置，自动继续只在宿主执行。旧客户端 localStorage 中的开启意图会显示迁移提示，不会静默开启宿主。
 
 ### ON AIR 桌面件
 
@@ -174,7 +172,7 @@ widget\onair-widget.bat 8092       :: 指定端口
 - 服务：`ctx.sessions.list()`、`ctx.agents.get(id)`、`ctx.tools`、`ctx.webServer.tapIndex`、
   `agent.followup(...)`
 - 客户端：`window.__ModuleLoader__.load`、`slots.register('conversation.input.left')`、
-  `ctx.locale.register`、`ctx.sessions.binding`
+  `ctx.locale.register`
 
 ### 客户端插件的两条硬性要求
 
@@ -196,7 +194,16 @@ widget\onair-widget.bat 8092       :: 指定端口
 node test/smoke.mjs        # 客户端插件断言
 node test/load-sim.mjs     # 客户端加载/注册/渲染链路模拟（需要 React）
 node host/test-core.mjs    # 宿主侧状态机断言
+node test/endpoint-routing.mjs # 桌面 / web 双实例端口路由
+node test/dashboard.mjs    # 生成页面脚本、状态统计与离线提示
+node widget/build.mjs      # Windows 桌面件：编译源码并内嵌共享 XAML
+node dev/preview.mjs       # 隔离的 Glass UI 预览（模拟会话数据）
 ```
+
+Glass 预览默认运行在 <http://127.0.0.1:18091>，会话浮窗见 <http://127.0.0.1:18091/popup>；
+预览操作不会发送到真实 DSH 会话。Windows 桌面件的前景离屏布局检查可运行 `node dev/render-widget.mjs`，
+该检查需要能够运行 .NET Framework/WPF 的 Windows 环境；系统背景模糊仍需实机验收。
+双实例端口核查、已实现变更及后续优先级见 [优化方案](docs/optimization-plan.md)。
 
 `test/load-sim.mjs` 需要一个可解析的 React/ReactDOM。脚本会依次尝试
 `DSH_REACT_ROOT` → `DSH_CHECKOUT` → 常规 Node 解析（插件目录、逐级向上、
@@ -225,3 +232,19 @@ node test/load-sim.mjs
 ## 许可证
 
 MIT
+
+## 1.2.0 实例绑定与暂存消息
+
+宿主在页面脚本加载前注入 API 地址、稳定实例 ID 和 profile；缺少注入或身份不一致时客户端显示“未绑定宿主”，禁止发送。端口选择优先级为 SM_PORT > config.port > 3091，绑定失败回退 8091–8100；桌面件启动参数使用实际绑定端口。当前机器 desktop 为 8091、web 为 8092，二者独立。
+
+设置使用版本 2 文件按 profile 保存，实例 ID 随重启保留。首次从旧全局 settings.json 迁移，保留原文件；损坏文件会报错而非覆盖。自定义安装可配置 profileId 或 SM_PROFILE，避免依赖端口推断。
+
+暂存队列按实例保存在浏览器 localStorage，状态包括待发送、发送中、已发送、失败、结果未知。浏览器关闭时计时暂停。发送使用 requestId 去重，只有宿主确认 followup 成功后才标记已发送；回执丢失会查询宿主，无法确认时需要核实后手动重发。回执仅保留在宿主内存，重启后不可查询；这不是持久化后台调度。旧队列保留为可复制草稿，需重新选择目标。
+
+连接中断保留上次会话列表并禁用消息操作；活动时间来自实际事件。完成、空闲、普通错误和限流有独立状态。Glass 界面采用青绿活动、淡蓝等待、淡紫完成和珊瑚红异常；Windows 原生模糊不可用时使用实色回退。
+
+## 可选 LH bridge
+
+默认不扫描 LH。显式设置 SM_LH_RUNS_ROOT 后读取其 run 日志；SM_LH_WEB_URL 默认 http://127.0.0.1:8799。SM_LH_AUTORESUME=1 允许对有 429 证据的失败 run 自动 resume，SM_LH_MAX_RESUME 默认 2。此桥接独立于 DSH 会话自动继续，不保证跨宿主重启去重。
+
+开发检查：npm install --ignore-scripts 后运行 npm test；Windows 运行 npm run build:widget。构建会生成 widget/build-manifest.json，记录每个源码及 exe 的 SHA256 和基础提交，未提交改动以源码摘要为准。CI 覆盖 Node 22/24 逻辑与 Windows 编译、前景布局渲染；系统模糊与 DPI 仍需实机检查。

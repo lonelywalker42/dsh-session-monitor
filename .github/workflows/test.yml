@@ -1,0 +1,31 @@
+name: Monitor checks
+on: [push, pull_request]
+jobs:
+  logic:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --ignore-scripts
+      - run: npm test
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node widget/build.mjs
+      - run: node dev/render-widget.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: widget-verification
+          path: |
+            widget/onair-widget.exe
+            widget/build-manifest.json
+            .preview/widget.png

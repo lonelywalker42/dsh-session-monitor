@@ -197,6 +197,7 @@ export function createMonitorCore(options = {}) {
   const archived = new Map() // sessionId -> last archived record (cap)
   const listeners = new Set()
   const autoSent = new Set() // `${sessionId}:${turnEndSeq}` 已自动继续的事件
+  const deliveries = new Map()
   /** token-plan 额度用尽型 429 的长间隔定时重试器：sessionId -> timer（默认 1h 一次）。 */
   const tokenPlanTimers = new Map()
   const tokenPlanMs = options.tokenPlanRetryMs || 3600000
@@ -211,15 +212,18 @@ export function createMonitorCore(options = {}) {
    */
   function scheduleTokenPlanRetry(rec, settings) {
     if (tokenPlanTimers.has(rec.id)) return
-    rec.statusText = '额度用尽（token plan），每 ' + Math.round(tokenPlanMs / 60000) + ' 分钟自动重试一次'
+    const interval = settings.tokenPlanRetryMs || tokenPlanMs
+    rec.statusText = '额度用尽（token plan），每 ' + Math.round(interval / 60000) + ' 分钟自动重试一次'
     const timer = setInterval(() => {
       const cur = records.get(rec.id)
-      if (!cur || cur.state !== 'error429') { clearTokenPlanTimer(rec.id); return }
+      if (!cur || cur.state !== 'error429' || !settings.autoRetry || settings.monitoring === false) { clearTokenPlanTimer(rec.id); return }
+      if (cur.retries >= settings.maxRetries) { cur.statusText = '自动继续已达上限'; clearTokenPlanTimer(rec.id); notify(); return }
       // 仍卡在额度用尽 → 尝试发送「继续」（异步 followup，等待驱动处理）
       const r = continueSession(rec.id)
       if (r.ok) { cur.statusText = '额度用尽重试：已发送「继续」，等待额度恢复' }
       else { cur.statusText = '额度用尽重试失败: ' + (r.reason || 'unknown') }
-    }, tokenPlanMs)
+      notify()
+    }, interval)
     tokenPlanTimers.set(rec.id, timer)
   }
   /** 插件卸载时清理全部定时器。 */
@@ -291,7 +295,13 @@ export function createMonitorCore(options = {}) {
     return String(e && e.message || e) + (stack ? '  [' + stack + ']' : '')
   }
 
-  function continueSession(id, text = '继续') {
+  function continueSession(id, text = '继续', requestId = randomUUID()) {
+    if (typeof requestId !== 'string' || !requestId || requestId.length > 160) return { ok: false, reason: 'invalid-request-id' }
+    const existing = deliveries.get(requestId)
+    if (existing) {
+      if (existing.sessionId !== id || existing.text !== text) return { ok: false, reason: 'request-id-conflict' }
+      return { ok: existing.status !== 'failed', queued: existing.status === 'sending', requestId, reason: existing.reason }
+    }
     // 0.1.2：agent/created 可能迟到/未达（尤其恢复会话），回退权威注册表 ctx.agents.get(id)
     const agent = resolveAgent(id)
     if (!agent || typeof agent.followup !== 'function') {
@@ -300,29 +310,37 @@ export function createMonitorCore(options = {}) {
       return { ok: false, reason: 'no-agent' }
     }
     try {
-      const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
+      const message = { id: requestId, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
       const rec = records.get(id)
       // 关键修复（0.1.2 适配）：在 session/event 发布期间（如 turn/end 监听回调内）同步调用
       // agent.followup 会触发 session.append('agent/inbox/spliced')，与正在发布的 append 重入冲突
       // （"session append cannot reenter while another append is being published"）。
       // 将 followup 推迟到下一 tick，让当前 append 发布完成后再入队。
-      if (typeof setImmediate === 'function') {
-        setImmediate(() => {
-          try {
-            agent.followup(message)
-            if (rec) { rec.statusText = '已发送「' + text + '」，等待驱动处理' }
-          } catch (e) {
-            const detail = errDetail(e)
-            if (rec) rec.statusText = '异步发送失败: ' + detail
-            try { process.stderr.write(`[dsh-session-monitor][continue] ${id} 异步发送失败: ${detail}\n`) } catch (e2) { /* ignore */ }
-          }
-        })
-      } else {
-        agent.followup(message)
-        if (rec) rec.statusText = '已发送「' + text + '」，等待驱动处理'
+      let finish
+      const delivery = { requestId, sessionId: id, text, status: 'sending', reason: '', createdAt: Date.now(), promise: new Promise(resolve => { finish = resolve }) }
+      deliveries.set(requestId, delivery)
+      for (const [key, value] of deliveries) {
+        if (deliveries.size <= 1000) break
+        if (value.status !== 'sending') deliveries.delete(key)
       }
+      const dispatch = async () => {
+        try {
+          const result = await agent.followup(message)
+          if (result && result.ok === false) throw new Error(result.reason || 'followup-rejected')
+          delivery.status = 'sent'
+          if (rec) rec.statusText = '已发送「' + text + '」，等待驱动处理'
+          finish({ ok: true, queued: false, requestId, status: 'sent' })
+        } catch (e) {
+          delivery.status = 'failed'; delivery.reason = errDetail(e)
+          if (rec) { rec.statusText = '发送失败: ' + delivery.reason; rec.retries = Math.max(0, rec.retries - 1) }
+          finish({ ok: false, requestId, status: 'failed', reason: delivery.reason })
+        }
+        notify()
+      }
+      if (typeof setImmediate === 'function') setImmediate(dispatch)
+      else Promise.resolve().then(dispatch)
       if (rec) { rec.retries += 1; rec.autoSentAt = Date.now() }
-      return { ok: true, queued: true }
+      return { ok: true, queued: true, requestId }
     } catch (e) {
       const detail = errDetail(e)
       const rec = records.get(id)
@@ -332,11 +350,29 @@ export function createMonitorCore(options = {}) {
     }
   }
 
+  function deliveryReceipt(requestId) {
+    const receipt = deliveries.get(requestId)
+    if (!receipt) return { ok: false, reason: 'receipt-unavailable' }
+    return { ok: true, requestId, sessionId: receipt.sessionId, status: receipt.status, reason: receipt.reason }
+  }
+  function waitForDelivery(requestId) {
+    const receipt = deliveries.get(requestId)
+    return receipt ? receipt.promise : Promise.resolve({ ok: false, reason: 'receipt-unavailable' })
+  }
+  function applySettings(settings) {
+    clearAllTokenPlanTimers()
+    if (!settings.autoRetry || settings.monitoring === false) { notify(); return }
+    for (const rec of records.values()) {
+      if (rec.state === 'error429' && rec.monitored) maybeAutoContinue(rec, rec.lastAlertKey, settings)
+    }
+    notify()
+  }
+
   /** 429 停止后自动继续（用户设定开启时；同一停止只发一次）。 */
   function maybeAutoContinue(rec, stopKey, settings) {
     const tag = (rec ? rec.id : '?') + ':' + (stopKey || '?')
     const note = (m) => { try { process.stderr.write(`[dsh-session-monitor][autocontinue] ${m}\n`) } catch (e) { /* ignore */ } }
-    if (!settings.autoRetry) { note(`${tag} 跳过: autoRetry=false`); return false }
+    if (!settings.autoRetry || settings.monitoring === false) { note(`${tag} 跳过: autoRetry=false`); return false }
     if (!rec || rec.state !== 'error429') { note(`${tag} 跳过: state=${rec ? rec.state : '(null)'}`); return false }
     // 额度用尽型（token plan entitlement exhausted，5h 额度用尽）：立即发送「继续」无意义，
     // 进入长间隔定时重试（默认 1h 一次），等待额度恢复。
@@ -347,13 +383,13 @@ export function createMonitorCore(options = {}) {
       return false
     }
     if (rec.retries >= settings.maxRetries) { rec.statusText = '自动继续已达上限，请在仪表盘手动发送'; note(`${tag} 跳过: retries=${rec.retries} 达上限`); return false }
-    const k = (rec.id || '') + ':' + (stopKey || rec.lastAlertKey || Date.now())
+    const k = (rec.id || '') + ':' + String(stopKey || rec.lastAlertKey || Date.now()).replace(/^(turn|fold):/, 'stop:')
     if (autoSent.has(k)) { note(`${tag} 跳过: 已发送过(去重)`); return false }
     if (resolveAgent(rec.id)) autoSent.add(k) // resolver 感知，防对账循环重复发
     const r = continueSession(rec.id)
     if (!r.ok) { rec.statusText = '自动继续失败: ' + (r.reason || 'unknown'); note(`${tag} 失败: ${r.reason}`) }
     else { note(`${tag} 已发送「继续」`) }
-    if (r.ok && autoSent.size > 1000) autoSent.clear()
+    if (r.ok && autoSent.size > 1000) autoSent.delete(autoSent.values().next().value)
     return r.ok
   }
 
@@ -404,6 +440,7 @@ export function createMonitorCore(options = {}) {
         rec.running = false
         if (failure && is429Failure(failure)) {
           rec.state = 'error429'; rec.stateSince = now; rec.lastActivity = now
+          rec.lastAlertSeq = event.seq || 0
           pushAlert(rec, '429', failure.code || 'RATE_LIMIT', failure.message || '', event.time, `turn:${event.seq}`)
           maybeAutoContinue(rec, `turn:${event.seq}`, extras.settings || { autoRetry: false, maxRetries: 3 })
         } else if (failure) {
@@ -528,9 +565,9 @@ export function createMonitorCore(options = {}) {
       rec.retries = 0
       rec.autoSentAt = 0
       clearTokenPlanTimer(rec.id) // 会话恢复 → 停止额度用尽定时重试
-      for (const key of [...autoSent]) if (key.startsWith(rec.id + ':')) autoSent.delete(key)
     }
-    rec.lastActivity = Math.max(rec.lastActivity || 0, now)
+    const eventTime = (extras.events || []).reduce((latest, event) => Math.max(latest, Number(event.time) || 0), Number(folded.alert && folded.alert.time) || 0)
+    rec.lastActivity = Math.max(rec.lastActivity || 0, eventTime)
     rec.title = (rec.title && rec.title !== rec.id) ? rec.title : titleOf(rec)
     notify()
   }
@@ -583,45 +620,77 @@ export function createMonitorCore(options = {}) {
   }
 
   return {
-    records, agents, autoSent, tokenPlanTimers,
+    records, agents, autoSent, tokenPlanTimers, deliveries,
     subscribe, ensure, titleOf, addToMonitor, pushAlert, continueSession, maybeAutoContinue,
-    scheduleTokenPlanRetry, clearTokenPlanTimer, clearAllTokenPlanTimers,
+    scheduleTokenPlanRetry, clearTokenPlanTimer, clearAllTokenPlanTimers, applySettings, deliveryReceipt, waitForDelivery,
     onSessionEvent, onAgentStatus, onAgentError, onAgentDisposed, resolveFromFold, markRead, remove, snapshot, notify,
   }
 }
 
 // ==================== 设置持久化 ====================
 
-function settingsPath() {
-  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-  return path.join(home, 'storages', 'session-monitor', 'settings.json')
+export function resolveProfile(config = {}, env = process.env, modulePath = fileURLToPath(import.meta.url)) {
+  const explicit = config.profileId || env.SM_PROFILE || env.DSH_PROFILE
+  if (explicit) return String(explicit)
+  if (env.DSH_PROFILE_DIR) return path.basename(env.DSH_PROFILE_DIR.replace(/[\\/]+$/, ''))
+  const match = modulePath.replace(/\\/g, '/').match(/\/profiles\/([^/]+)\//)
+  if (match) return match[1]
+  // A custom file:// install has no profile path. The Electron host is desktop.
+  if (process.versions.electron) return 'desktop'
+  return 'endpoint-' + String(env.SM_PORT || config.port || 3091)
 }
 
-function loadSettings(defaults) {
-  try {
-    const raw = fs.readFileSync(settingsPath(), 'utf8')
-    const p = JSON.parse(raw)
-    return Object.assign({}, defaults, p)
-  } catch (e) {
-    return Object.assign({}, defaults)
+export function normalizeSettings(patch = {}, defaults = {}) {
+  patch = patch && typeof patch === 'object' ? patch : {}
+  const result = { ...defaults }
+  for (const key of ['autoRetry', 'monitoring', 'desktopDisplay']) {
+    if (typeof patch[key] === 'boolean') result[key] = patch[key]
   }
+  for (const [key, min, max] of [['maxRetries', 1, 10], ['tokenPlanRetryMs', 60000, 86400000]]) {
+    if (Number.isFinite(patch[key])) result[key] = Math.max(min, Math.min(max, Math.floor(patch[key])))
+  }
+  if (Number.isFinite(patch.tokenPlanRetryMin)) result.tokenPlanRetryMs = Math.max(1, Math.min(1440, Math.floor(patch.tokenPlanRetryMin))) * 60000
+  return result
 }
 
-function saveSettings(settings) {
-  try {
-    const file = settingsPath()
+export function createSettingsStore({ home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), profile, defaults }) {
+  const root = path.join(home, 'storages', 'session-monitor')
+  const file = path.join(root, 'profiles', 'profile-' + encodeURIComponent(profile), 'settings.json')
+  let previous = null, migrated = false
+  try { previous = JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) {
+    if (e.code !== 'ENOENT') throw e // do not overwrite corrupt settings or an unreadable identity
+  }
+  if (previous && (previous.schemaVersion !== 2 || previous.profile !== profile || !previous.instanceId)) {
+    throw new Error('Unsupported or mismatched monitor settings: ' + file)
+  }
+  let saved = previous && previous.settings
+  if (!previous) {
+    try { saved = JSON.parse(fs.readFileSync(path.join(root, 'settings.json'), 'utf8')); migrated = true } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+    }
+  }
+  const instanceId = previous ? previous.instanceId : randomUUID()
+  const settings = normalizeSettings(saved, defaults)
+  function save(next) {
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, JSON.stringify(settings, null, 2))
-  } catch (e) { /* ignore */ }
+    const temp = file + '.' + randomUUID() + '.tmp'
+    try {
+      fs.writeFileSync(temp, JSON.stringify({ schemaVersion: 2, profile, instanceId, settings: next }, null, 2))
+      fs.renameSync(temp, file)
+    } finally { try { fs.unlinkSync(temp) } catch (e) { if (e.code !== 'ENOENT') throw e } }
+  }
+  if (!previous) save(settings) // migrate once; leave the global legacy file intact
+  return { settings, instanceId, profile, file, migrated, save }
 }
 
 // ==================== 仪表盘 ====================
 
-function dashboardHtml() {
+export function dashboardHtml() {
   return `<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DSH 会话监控</title>
 <style>
   :root { color-scheme: dark; }
@@ -660,25 +729,47 @@ function dashboardHtml() {
   .archived h2 { font-size: 13px; color: #999; }
   .archived table td { padding: 4px 10px; font-size: 12px; }
   footer { padding: 12px 20px 20px; color: #666; font-size: 12px; text-align: center; }
+  :root { --text:#e8eefb; --muted:#9aaac6; --line:#bfd0ff24; --glass:linear-gradient(130deg,#a5c0ff0f,#b49bff05); }
+  body { min-height:100vh; background:radial-gradient(ellipse at 12% 0%,#344b7966,transparent 50%),radial-gradient(ellipse at 90% 25%,#66549340,transparent 45%),#10182a; background-attachment:fixed; color:var(--text); }
+  header { margin:20px auto 0; max-width:1160px; padding:16px 24px; gap:16px; flex-wrap:wrap; border:1px solid var(--line); border-radius:18px; background:#1b2845b3; backdrop-filter:blur(28px) saturate(140%); -webkit-backdrop-filter:blur(28px) saturate(140%); box-shadow:0 12px 40px #060c2326,inset 0 1px #ffffff14; }
+  header h1 { font-size:15px; letter-spacing:.2px; } header .sub,.count { color:var(--muted); } header .sub { font-size:11px; } .toggle { background:#bfd0ff0a; border-color:var(--line); border-radius:10px; font-size:12px; padding:8px 12px; } .toggle input { accent-color:#a0b5ff; }
+  main { max-width:1160px; padding:28px 0 40px; } .hero { margin:10px 4px 26px; } .eyebrow { color:#a3b8e4; font-size:10px; letter-spacing:3px; } .hero h2 { font-size:30px; font-weight:650; margin:10px 0; letter-spacing:-.6px; } .hero p { color:var(--muted); font-size:13px; margin:0; line-height:1.8; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:24px; } .stat { padding:18px 22px; border:1px solid var(--line); border-radius:16px; background:var(--glass); backdrop-filter:blur(22px); box-shadow:inset 0 1px #ffffff0f; } .stat span { color:var(--muted); font-size:12px; } .stat strong { display:block; font-size:30px; font-weight:600; margin-top:8px; font-variant-numeric:tabular-nums; } .stat.active strong{color:#6ee7b7;} .stat.wait strong{color:#93c5fd;} .stat.alerts strong{color:#fda4af;} .stat.done strong{color:#c4b5fd;}
+  .table-shell { overflow-x:auto; padding:8px 16px 16px; border:1px solid var(--line); border-radius:20px; background:#1d294570; backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px); box-shadow:0 16px 40px #060c2326,inset 0 1px #ffffff14; } .section-heading { display:flex; align-items:center; justify-content:space-between; padding:16px 4px 14px; } .section-heading h2 { font-size:14px; margin:0; } .section-heading span { color:var(--muted);font-size:11px; }
+  table { min-width:840px; border-collapse:separate; border-spacing:0 6px; } th { font-size:11px; color:var(--muted); border:0; padding:10px 12px; } td { border:0; padding:14px 12px; background:#bfd0ff07; vertical-align:middle; } td:first-child { border-radius:10px 0 0 10px; } td:last-child { border-radius:0 10px 10px 0; white-space:nowrap; } tbody tr:hover td { background:#bfd0ff10; } td.title { max-width:240px; font-size:12px; } td.id,.id { color:var(--muted); font-size:10px; font-weight:400; display:inline-block; margin-top:5px; } .time { color:#a7b8d2; font-size:11px; } .alert { max-width:220px; display:block; color:#fda4af; font-size:11px; }
+  .state { padding:5px 8px; border-radius:7px; background:#bfd0ff0d; font-size:11px; white-space:nowrap; } .s-active .state{color:#6ee7b7;background:#6ee7b70d;} .s-active .dot{background:#6ee7b7;} .s-waiting-answer .state,.s-waiting-approval .state{color:#93c5fd;background:#93c5fd0d;} .s-error429 .state,.s-error .state{color:#fda4af;background:#fb718515;} .s-error429 .dot{background:#fb7185;} .s-complete .state{color:#c4b5fd;background:#c4b5fd0d;} .s-complete .dot{background:#c4b5fd;}
+  button { min-height:30px; padding:5px 10px; border-radius:8px; border-color:var(--line); background:#bfd0ff0a; color:#d7e2fa; } button:hover { background:#bfd0ff20; } button.primary { background:linear-gradient(120deg,#7598f1,#9384e9); border:1px solid #b4c6ff4d; box-shadow:0 3px 12px #8095ff20; } button:focus-visible,input:focus-visible { outline:2px solid #a0bdff; outline-offset:3px; } .empty { color:var(--muted); line-height:1.9; padding:36px 16px; font-size:12px; } .archived { opacity:1; overflow-x:auto; } .archived:empty{display:none;} .archived h2{color:var(--muted);margin:26px 4px 12px;} footer{color:var(--muted);font-size:11px;line-height:1.8;} #health[data-online=false]{color:#fda4af;}
+  @media(max-width:1200px){header{margin:16px;}main{padding:16px;}header .sub{display:none;}header #health{display:block;}} @media(max-width:640px){header{padding:14px;gap:10px;}.hero h2{font-size:26px;}.stats{grid-template-columns:repeat(2,1fr);gap:10px;}.stat{padding:14px 18px;}.stat strong{font-size:26px;}.toggle{order:3;}#health{display:block;}.table-shell{padding:4px 10px 12px;}}
+  @media(prefers-reduced-motion:reduce){.dot{animation:none;}} @supports not (backdrop-filter:blur(1px)){header,.table-shell,.stat{background:#1d2945;}}
 </style>
 </head>
 <body>
 <header>
-  <h1>🐙 DSH 会话监控</h1>
-  <span class="sub">独立主机侧监控 · 全部会话 · 429 提醒</span>
+  <h1>◈ DSH Monitor</h1>
+  <span class="sub">会话监控中心</span>
   <div class="spacer"></div>
   <span class="count" id="count"></span>
-  <label class="toggle"><input type="checkbox" id="autoRetry"> 自动继续（429 停止后发送「继续」）</label>
-  <span id="health" class="sub"></span>
+  <label class="toggle" title="429 停止后向对应会话发送「继续」"><input type="checkbox" id="autoRetry" disabled> 自动继续</label>
+  <span id="health" class="sub" role="status">正在连接…</span>
 </header>
 <main>
+  <section class="hero"><span class="eyebrow">SESSION OVERVIEW</span><h2>每个会话，尽在掌握。</h2><p>实时关注运行进度，及时处理等待与中断。</p></section>
+  <section class="stats" aria-label="会话状态概览">
+    <div class="stat active"><span>活动中</span><strong id="stat-active">—</strong></div>
+    <div class="stat wait"><span>等待处理</span><strong id="stat-wait">—</strong></div>
+    <div class="stat alerts"><span>异常 / 限流</span><strong id="stat-alert">—</strong></div>
+    <div class="stat done"><span>工作完成</span><strong id="stat-done">—</strong></div>
+  </section>
+  <section class="table-shell"><div class="section-heading"><h2>全部会话</h2><span>每秒自动更新</span></div>
   <table>
     <thead><tr><th>状态</th><th>会话</th><th>活动</th><th>最近告警</th><th>自动继续</th><th>操作</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <div class="empty" id="empty" style="display:none">当前没有进行中的会话。新会话进入「活动中」后会自动出现在这里；工作完成后保留，等你阅读后「已读」移除。</div>
+  </section>
   <div class="archived" id="archived"></div>
 </main>
+<div id="operation-result" role="status" style="text-align:center;color:#c4b5fd;font-size:12px"></div>
 <footer>自动继续仅发给发生 429 的那个会话（按会话精确路由）。数据来自 dsh 主机进程，与 webui 是否打开无关。</footer>
 <script>
 var API = '';
@@ -686,7 +777,7 @@ function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,
 function fmt(ts){ if(!ts) return ''; var d=new Date(ts); return d.toLocaleTimeString('zh-CN',{hour12:false}) }
 function elapsed(since){ if(!since) return ''; var s=Math.max(0,Math.floor((Date.now()-since)/1000)); if(s<60) return s+'s'; var m=Math.floor(s/60); if(m<60) return m+'m'+s%60+'s'; return Math.floor(m/60)+'h'+(m%60)+'m' }
 function stateRow(s){
-  var alertHtml = s.alerts.length ? '<span class="alert '+(s.alerts[0].kind==='retry'?'retry':'')+'">'+esc((s.alerts[0].kind==='429'?'[429] ':(s.alerts[0].kind==='retry'?'[重试中] ':'[报错] '))+esc(s.alerts[0].code)+' '+esc(trunc(s.alerts[0].message,60))+'</span>' : '<span style="color:#555">—</span>'
+  var alertHtml = s.alerts.length ? '<span class="alert '+(s.alerts[0].kind==='retry'?'retry':'')+'">'+esc((s.alerts[0].kind==='429'?'[429] ':(s.alerts[0].kind==='retry'?'[重试中] ':'[报错] ')))+esc(s.alerts[0].code)+' '+esc(trunc(s.alerts[0].message,60))+'</span>' : '<span style="color:#555">—</span>'
   var act = s.state==='active' && s.activeSince ? elapsed(s.activeSince) : fmt(s.lastActivity)
   return '<tr class="s-'+esc(s.state)+'">'+
     '<td><span class="state"><span class="dot"></span>'+esc(s.stateText)+'</span></td>'+
@@ -701,10 +792,14 @@ function stateRow(s){
     '</td></tr>'
 }
 function trunc(s,n){ s=String(s==null?'':s); return s.length>n?s.slice(0,n)+'…':s }
-function cwdShort(c){ c=String(c==null?'':c); if(!c) return ''; var p=c.replace(/[\\/]+$/,'').split(/[\\/]/); var last=p.pop()||''; var prev=p.pop(); return prev ? (prev+'\\'+last) : last }
+function cwdShort(c){ c=String(c==null?'':c); if(!c) return ''; var sep=String.fromCharCode(92); var p=c.split(sep).join('/').split('/').filter(Boolean); var last=p.pop()||''; var prev=p.pop(); return prev ? (prev+sep+last) : last }
 function render(state){
   document.getElementById('autoRetry').checked = !!state.settings.autoRetry;
-  document.getElementById('count').textContent = state.total + ' 个进行中会话';
+  document.getElementById('count').textContent = state.total + ' 个会话';
+  document.getElementById('stat-active').textContent = state.sessions.filter(function(s){return s.state==='active'}).length;
+  document.getElementById('stat-wait').textContent = state.sessions.filter(function(s){return s.state==='waiting-answer'||s.state==='waiting-approval'}).length;
+  document.getElementById('stat-alert').textContent = state.sessions.filter(function(s){return s.state==='error429'||s.state==='error'}).length;
+  document.getElementById('stat-done').textContent = state.sessions.filter(function(s){return s.state==='complete'}).length;
   var rows = document.getElementById('rows');
   rows.innerHTML = state.sessions.map(stateRow).join('');
   document.getElementById('empty').style.display = state.sessions.length ? 'none' : 'block';
@@ -715,22 +810,53 @@ function render(state){
       '</tbody></table>'
   } else arch.innerHTML = '';
   document.getElementById('health').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  document.getElementById('health').dataset.online = 'true';
+}
+var online = false, hostInstance = null, refreshing = false, mutating = false;
+function setOnline(value) {
+  online = value;
+  document.getElementById('autoRetry').disabled = !value || mutating;
+  Array.prototype.forEach.call(document.querySelectorAll('button[data-act]'), function(button){button.disabled=!value||mutating});
 }
 async function refresh(){
-  try { var r = await fetch(API+'/api/state'); render(await r.json()) } catch(e) { /* server down */ }
+  if(refreshing)return;
+  refreshing=true;
+  var controller=typeof AbortController==='function'?new AbortController():null;
+  var timeout=setTimeout(function(){if(controller)controller.abort()},5000);
+  try {
+    var response=await fetch(API+'/api/state',{cache:'no-store',signal:controller?controller.signal:undefined});
+    if(!response.ok)throw new Error('连接中断');
+    var state=await response.json();
+    if(!state.instance||!state.instance.id)throw new Error('未绑定宿主，请更新监控插件');
+    if(hostInstance&&(state.instance.id!==hostInstance.id||state.instance.profile!==hostInstance.profile))throw new Error('宿主身份变化，请重新加载页面');
+    hostInstance=state.instance;
+    render(state);setOnline(true);
+    document.getElementById('health').textContent=hostInstance.profile+' · 更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  } catch(error) {
+    var health=document.getElementById('health');health.textContent=error.message+' · 正在重试';health.dataset.online='false';setOnline(false);
+  } finally {clearTimeout(timeout);refreshing=false;}
 }
-document.addEventListener('click', async function(e){
-  var b = e.target.closest('button[data-act]'); if(!b) return;
-  var id = b.getAttribute('data-id'), act = b.getAttribute('data-act');
-  if(act==='continue'){ await fetch(API+'/api/session/'+encodeURIComponent(id)+'/continue',{method:'POST'}) }
-  else if(act==='read'){ await fetch(API+'/api/session/'+encodeURIComponent(id)+'/read',{method:'POST'}) }
-  else if(act==='remove'){ await fetch(API+'/api/session/'+encodeURIComponent(id)+'/remove',{method:'POST'}) }
-  refresh();
+async function mutate(url,payload){
+  if(!online||mutating||!hostInstance)return;
+  mutating=true;setOnline(online);
+  var feedback=document.getElementById('operation-result');
+  try {
+    var response=await fetch(API+url,{method:'POST',headers:{'Content-Type':'application/json','X-DSH-Monitor-Instance':hostInstance.id},body:JSON.stringify(payload||{})});
+    var result=await response.json();
+    if(!response.ok||!result.ok)throw new Error(result.reason||'操作失败');
+    feedback.textContent=result.status==='sent'?'消息已发送':'操作已保存';
+  } catch(error){feedback.textContent='操作失败：'+error.message;}
+  finally {mutating=false;setOnline(online);await refresh();}
+}
+document.addEventListener('click',function(event){
+  var button=event.target.closest('button[data-act]');if(!button||button.disabled)return;
+  var act=button.getAttribute('data-act'),id=button.getAttribute('data-id');
+  var payload=act==='continue'?{requestId:typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(36).slice(2)}:{};
+  mutate('/api/session/'+encodeURIComponent(id)+'/'+act,payload);
 });
-document.getElementById('autoRetry').addEventListener('change', async function(e){
-  await fetch(API+'/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autoRetry:e.target.checked})});
-});
-refresh(); setInterval(refresh, 1000);
+document.getElementById('autoRetry').addEventListener('change',function(event){mutate('/api/settings',{autoRetry:event.target.checked})});
+setOnline(false);refresh();setInterval(refresh,1000);
+
 </script>
 </body>
 </html>`
@@ -740,66 +866,14 @@ refresh(); setInterval(refresh, 1000);
 // 复用 lan-gate 模式：向 DSH「设置」对话框追加「会话监控」导航单元与设置面板，
 // 控制监控开关 / ON AIR 桌面显示 / 自动继续等（数据读写 :8091/api/settings，CORS 已开放）。
 
-function settingsScript(base) {
-  const js = '(function(){'
-    + 'var BASE=' + JSON.stringify(base) + ';'
-    + 'var active=false,timer=null,panelNode=null,cell=null,opts=null;'
-    + 'function esc(s){return String(s==null?\'\':s).replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\').replace(/\'/g,\'&#39;\').replace(/"/g,\'&quot;\')}'
-    + 'function get(){return fetch(BASE+\'/api/settings\').then(function(r){return r.json()}).catch(function(){return null})}'
-    + 'function set(patch){return fetch(BASE+\'/api/settings\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(patch)}).then(function(r){return r.json()}).catch(function(){return null})}'
-    + 'function toggle(patch){set(patch).then(function(){refresh()})}'
-    + 'function stateBadge(){return fetch(BASE+\'/api/state\').then(function(r){return r.json()}).catch(function(){return null})}'
-    + 'function refresh(){'
-    + '  if(!panelNode)return;'
-    + '  Promise.all([get(),stateBadge()]).then(function(r){'
-    + '    var s=(r[0]&&r[0].settings)||{};'
-    + '    var st=r[1]||null;'
-    + '    var n=st&&st.total?st.total:0;'
-    + '    var statusText=st?(\'监控中 \'+n+\' 个活动会话\'):\'主机监控离线\';'
-    + '    var h=\'<div style="padding:4px 2px 12px;font-size:13px">\';'
-    + '    h+=\'<div style="font-size:14px;font-weight:700;margin-bottom:8px">🐙 DSH 会话监控</div>\';'
-    + '    h+=\'<div style="color:#888;margin-bottom:10px">\'+esc(statusText)+\' · <a href="\'+BASE+\'/index.html" target="_blank" style="color:#4da6ff">独立仪表盘</a></div>\';'
-    + '    h+=row(\'monitoring\',\'会话监控\',\'监听全部会话的活动/429 状态\',s.monitoring!==false);'
-    + '    h+=row(\'autoRetry\',\'自动继续\',\'429 停止后自动发送「继续」（上限 3 次）\',s.autoRetry===true);'
-    + '    h+=row(\'desktopDisplay\',\'ON AIR 桌面显示\',\'启动/关闭演播室 ON AIR 桌面件\',s.desktopDisplay!==false);'
-    + '    h+=\'<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span style="color:#aaa;flex:0 0 96px">自动继续上限</span>\';'
-    + '    h+=\'<input id="sm-maxretries" type="number" min="1" max="10" value="\'+esc(s.maxRetries||3)+\'" style="width:64px;padding:4px;border-radius:6px;border:1px solid #444;background:#1c1f27;color:#eee"/>\';'
-    + '    h+=\'<button class="lg-btn" data-act="maxretries" style="padding:4px 10px;border-radius:6px;border:1px solid #444;background:#222;color:#ddd;cursor:pointer">应用</button></div>\';'
-    + '    h+=\'<div style="color:#777;font-size:12px;margin-top:8px">数据由主机进程提供，与 webui 是否打开无关。自动继续按会话精确路由，不会误发到其他会话。</div>\';'
-    + '    h+=\'</div>\';'
-    + '    panelNode.innerHTML=h;'
-    + '  });'
-    + '}'
-    + 'function row(id,label,desc,on){'
-    + '  return \'<label style="display:flex;align-items:center;gap:10px;margin:8px 0;cursor:pointer"><input type="checkbox" data-smbool="\'+id+\'" \'+(on?\'checked\':\'\')+\' style="accent-color:#ff5050;width:16px;height:16px"/><span><span style="display:block">\'+esc(label)+\'</span><span style="display:block;color:#888;font-size:12px">\'+esc(desc)+\'</span></span></label>\';'
-    + '}'
-    + 'function styleActive(){var all=document.querySelectorAll(\'.sm-nav-cell\');for(var i=0;i<all.length;i++){if(all[i]===cell&&active)all[i].classList.add(\'lg-nav-active\');else all[i].classList.remove(\'lg-nav-active\')}}'
-    + 'function attach(){'
-    + '  var dialog=document.querySelector(\'[role="dialog"][aria-modal="true"]\');'
-    + '  if(!dialog||dialog.getAttribute(\'data-sm-attached\'))return;'
-    + '  var nav=dialog.querySelector(\'nav\');if(!nav)return;'
-    + '  var kids=nav.children;var list=kids.length>1?kids[kids.length-1]:null;if(!list)return;'
-    + '  var contentNode=dialog.children[dialog.children.length-1];if(!contentNode)return;'
-    + '  opts=contentNode.children[contentNode.children.length-1];if(!opts)return;'
-    + '  dialog.setAttribute(\'data-sm-attached\',\'1\');'
-    + '  panelNode=document.createElement(\'div\');panelNode.className=\'lg-nav-holder\';panelNode.style.display=\'none\';'
-    + '  contentNode.appendChild(panelNode);'
-    + '  panelNode.addEventListener(\'click\',function(ev){'
-    + '    var el=ev.target;if(!el||!el.getAttribute)return;'
-    + '    var act=el.getAttribute(\'data-act\');if(act===\'maxretries\'){var v=parseInt(document.getElementById(\'sm-maxretries\').value,10)||3;toggle({maxRetries:Math.max(1,Math.min(10,v))});return}'
-    + '  });'
-    + '  panelNode.addEventListener(\'change\',function(ev){var el=ev.target;if(!el||!el.getAttribute)return;var bid=el.getAttribute(\'data-smbool\');if(bid){var patch={};patch[bid]=el.checked;toggle(patch)}});'
-    + '  cell=document.createElement(\'button\');cell.type=\'button\';cell.className=\'lg-nav-cell sm-nav-cell\';'
-    + '  cell.innerHTML=\'<span class="lg-nav-icon">🐙</span><span>会话监控</span>\';'
-    + '  cell.addEventListener(\'click\',function(ev){ev.stopPropagation();active=true;opts.style.display=\'none\';panelNode.style.display=\'block\';styleActive();refresh();if(timer){clearInterval(timer)}timer=setInterval(function(){if(active)refresh()},3000)});'
-    + '  list.appendChild(cell);'
-    + '  list.addEventListener(\'click\',function(ev){if(!ev.target.closest(\'.sm-nav-cell\')){active=false;if(timer){clearInterval(timer);timer=null}opts.style.display=\'\';panelNode.style.display=\'none\';styleActive()}},true);'
-    + '}'
-    + 'var mo=new MutationObserver(function(muts){for(var i=0;i<muts.length;i++){var ns=muts[i].addedNodes;for(var j=0;j<ns.length;j++){var n=ns[j];if(n.nodeType===1&&(n.matches?n.matches(\'[role="dialog"][aria-modal="true"]\'):false)){attach();return}if(n.nodeType===1&&n.querySelector&&n.querySelector(\'[role="dialog"][aria-modal="true"]\')){attach();return}}}});'
-    + 'mo.observe(document.body,{childList:true,subtree:true});'
-    + 'attach();'
-    + '})()'
-  return '<scr' + 'ipt>' + js + '</scr' + 'ipt>'
+export function injectMonitorEndpoint(html, base, instance) {
+  const source = typeof html === 'string' ? html : ''
+  const binding = instance ? { api: base + '/api', id: instance.id, profile: instance.profile } : null
+  const script = '<script>window.__DSH_MONITOR_BINDING__=' + JSON.stringify(binding).replace(/</g, '\\u003c') + ';window.__DSH_MONITOR_API__=' + JSON.stringify(base + '/api').replace(/</g, '\\u003c') + ';</script>'
+  // Publish before the client bundle runs; each profile owns its endpoint.
+  return /<head\b[^>]*>/i.test(source)
+    ? source.replace(/<head\b[^>]*>/i, (head) => head + script)
+    : script + source
 }
 
 // ==================== 插件主体 ====================
@@ -826,7 +900,9 @@ function applyInner(ctx, config) {
     // token-plan 额度用尽型 429 的定时重试间隔（毫秒，默认 1 小时）
     tokenPlanRetryMs: config.tokenPlanRetryMs || 3600000,
   }
-  const settings = loadSettings(defaults)
+  const store = createSettingsStore({ profile: resolveProfile(config), defaults })
+  const settings = store.settings
+  const instance = { id: store.instanceId, profile: store.profile }
   // 0.1.2 兼容：Session.events 改为 snapshotEvents()；authority agent 查询用 ctx.agents.get(id)
   const eventsOf = (s) => {
     if (!s) return undefined
@@ -934,12 +1010,12 @@ function applyInner(ctx, config) {
       const exeExists = fs.existsSync(WIDGET_EXE)
       if (exeExists) {
         // 直接启动原生 exe（无 powershell / cmd 窗口）
-        widgetProc = spawn(WIDGET_EXE, [String(PORT)], { detached: true, stdio: 'ignore', windowsHide: true })
+        widgetProc = spawn(WIDGET_EXE, [String(boundPort || PORT), '--instance', instance.id], { detached: true, stdio: 'ignore', windowsHide: true })
         widgetProc.on('error', (e) => { log('启动桌面件 exe 失败: ' + (e && e.message || e)) })
         widgetProc.unref()
         log(`已启动 ON AIR 桌面件（原生 exe: ${WIDGET_EXE}）`)
       } else {
-        widgetProc = spawn('cmd.exe', ['/c', 'start', '', WIDGET_BAT, String(PORT)], {
+        widgetProc = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-File', path.join(path.dirname(WIDGET_EXE), 'onair-widget.ps1'), '-Port', String(boundPort || PORT), '-Instance', instance.id], {
           detached: true, stdio: 'ignore', windowsHide: true,
         })
         widgetProc.on('error', (e) => { log('启动桌面件 bat 失败: ' + (e && e.message || e)) })
@@ -1152,6 +1228,7 @@ function applyInner(ctx, config) {
   core.snapshot = (settingsArg) => {
     const snap = rawSnapshot(settingsArg)
     snap.lh = lhSummary
+    snap.instance = instance
     return snap
   }
 
@@ -1179,7 +1256,7 @@ function applyInner(ctx, config) {
 
   function corsPreflight(req, res) {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '3600' })
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-DSH-Monitor-Instance', 'Access-Control-Max-Age': '3600' })
       res.end()
       return true
     }
@@ -1199,29 +1276,33 @@ function applyInner(ctx, config) {
       if (corsPreflight(req, res)) return
       const url = req.url || '/'
       try {
+        if (req.method === 'POST' && url.startsWith('/api/') && req.headers['x-dsh-monitor-instance'] !== instance.id) {
+          json(res, 409, { ok: false, reason: 'instance-mismatch' }); return
+        }
         if (url === '/' || url === '/index.html') {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           res.end(dashboardHtml())
           return
         }
         if (url === '/api/state') { json(res, 200, core.snapshot(settings)); return }
-        if (url === '/api/settings' && req.method === 'GET') { json(res, 200, { settings }); return }
+        const deliveryMatch = url.match(/^\/api\/delivery\/([^/]+)$/)
+        if (deliveryMatch && req.method === 'GET') {
+          const receipt = core.deliveryReceipt(decodeURIComponent(deliveryMatch[1]))
+          json(res, receipt.ok ? 200 : 404, { ...receipt, instance }); return
+        }
+        if (url === '/api/settings' && req.method === 'GET') { json(res, 200, { settings, instance }); return }
         if (url === '/api/settings' && req.method === 'POST') {
           const b = await body(req)
-          if (typeof b.autoRetry === 'boolean') settings.autoRetry = b.autoRetry
-          if (typeof b.maxRetries === 'number') settings.maxRetries = Math.max(1, Math.floor(b.maxRetries))
-          if (typeof b.monitoring === 'boolean') settings.monitoring = b.monitoring
-          // token-plan 额度用尽型定时重试间隔（分钟，最小 1）
-          if (typeof b.tokenPlanRetryMin === 'number') {
-            settings.tokenPlanRetryMs = Math.max(1, Math.floor(b.tokenPlanRetryMin)) * 60000
-          }
-          if (typeof b.desktopDisplay === 'boolean' && settings.desktopDisplay !== b.desktopDisplay) {
-            settings.desktopDisplay = b.desktopDisplay
-            if (b.desktopDisplay) spawnWidget()
+          const next = normalizeSettings(b, settings)
+          const displayChanged = next.desktopDisplay !== settings.desktopDisplay
+          store.save(next) // commit before changing in-memory behavior
+          Object.assign(settings, next)
+          core.applySettings(settings)
+          if (displayChanged) {
+            if (settings.desktopDisplay) spawnWidget()
             else killWidget()
           }
-          saveSettings(settings)
-          json(res, 200, { ok: true, settings })
+          json(res, 200, { ok: true, settings, instance })
           return
         }
         if (url === '/api/lh/scan' && req.method === 'POST') { lhScanOnce(); json(res, 200, { ok: true, lh: lhSummary }); return }
@@ -1243,8 +1324,9 @@ function applyInner(ctx, config) {
             // 支持自定义文本（测试模式发「你好」走同一权威链路）；缺省发「继续」
             const b = await body(req).catch(() => ({}))
             const text = b && typeof b.text === 'string' && b.text.trim() !== '' ? b.text : '继续'
-            const r = core.continueSession(id, text)
-            json(res, r.ok ? 200 : 500, r)
+            const r = core.continueSession(id, text, b.requestId)
+            const delivered = r.ok ? await core.waitForDelivery(r.requestId) : r
+            json(res, delivered.ok ? 200 : 500, { ...delivered, instance })
           }
           else if (op === 'read') { const r = core.markRead(id); json(res, r.ok ? 200 : 404, r) }
           else { const r = core.remove(id); json(res, r.ok ? 200 : 404, r) }
@@ -1278,7 +1360,7 @@ function applyInner(ctx, config) {
       log('HTTP 服务错误: ' + (e && e.message || e))
     })
     srv.listen(portCandidates[portIdx], HOST, () => {
-      boundPort = portCandidates[portIdx]
+      boundPort = srv.address().port
       server = srv
       log(`监控仪表盘: http://${HOST}:${boundPort}（独立于 webui，全部会话监控）`)
     })
@@ -1296,12 +1378,13 @@ function applyInner(ctx, config) {
   try {
     const injectSettingsPanel = (html) => {
       const base = 'http://127.0.0.1:' + (boundPort || PORT)
-      return (typeof html === 'string' ? html : '') + settingsScript(base)
+      return injectMonitorEndpoint(html, base, instance)
     }
     if (ctx.inject && typeof ctx.inject === 'function') {
       ctx.inject(['webServer'], (scope) => {
-        if (scope && typeof scope.tapIndex === 'function') {
-          ctx.effect(() => scope.tapIndex(injectSettingsPanel), 'session-monitor: settings panel injection')
+        const webServer = scope && (scope.webServer || scope)
+        if (webServer && typeof webServer.tapIndex === 'function') {
+          ctx.effect(() => webServer.tapIndex(injectSettingsPanel), 'session-monitor: settings panel injection')
         }
       })
     } else if (ctx.webServer && typeof ctx.webServer.tapIndex === 'function') {

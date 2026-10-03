@@ -2,7 +2,7 @@
   "id": "dsh-429-monitor",
   "name": "dsh-429-monitor",
   "description": "会话状态监测 + 429 错误检测 + 弹出小窗提醒",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "local",
   "license": "MIT"
 }

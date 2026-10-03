@@ -11,7 +11,8 @@
 # 启动：onair-widget.bat（powershell.exe -STA -WindowStyle Hidden）
 # 需要：Windows PowerShell 5.1 + WPF（Windows 自带）；脚本编码须为 UTF-8 with BOM
 
-param([int]$Port = 8091)
+param([int]$Port = 8091, [string]$Instance = "")
+$script:instanceId = $Instance
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -21,76 +22,13 @@ Add-Type -AssemblyName System.Windows.Forms
 
 $api = "http://127.0.0.1:$Port"
 
-$xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        Width="180" Height="44"
-        WindowStartupLocation="Manual">
-  <Grid>
-    <!-- 紧凑胶囊（默认；水平圆角矩形 + 发光状态指示灯慢速脉冲，仿「悬浮 AI 闲聊窗口」） -->
-    <Border x:Name="Capsule" CornerRadius="16" Background="#FF0A0E0A" BorderBrush="#73FF3B30" BorderThickness="1"
-            Cursor="Hand" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="14,0" Height="40">
-      <Border.Effect>
-        <DropShadowEffect x:Name="CapGlow" Color="#FFFF3B30" BlurRadius="16" ShadowDepth="0" Opacity="0.7"/>
-      </Border.Effect>
-      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-        <Ellipse x:Name="CapDot" Width="9" Height="9" Fill="#FF3B30" VerticalAlignment="Center" Margin="0,0,9,0">
-          <Ellipse.Effect>
-            <DropShadowEffect x:Name="CapDotGlow" Color="#FFFF3B30" BlurRadius="9" ShadowDepth="0" Opacity="0.95"/>
-          </Ellipse.Effect>
-        </Ellipse>
-        <TextBlock x:Name="CapText" Text="ON AIR" FontSize="15" FontWeight="Bold" Foreground="#FF3B30" FontFamily="Consolas" VerticalAlignment="Center"/>
-        <TextBlock x:Name="CapCount" Text="" FontSize="13" FontWeight="Bold" Foreground="#FF9A3C" FontFamily="Consolas" VerticalAlignment="Center" Margin="9,0,0,0"/>
-        <Button x:Name="CapClose" Content="✕" FontSize="12" Width="20" Height="20" Padding="0" Margin="9,0,-4,0"
-                Background="Transparent" Foreground="#999" BorderThickness="0" Cursor="Hand" VerticalAlignment="Center"/>
-      </StackPanel>
-    </Border>
-    <!-- 展开全窗口 -->
-    <Border x:Name="Panel" CornerRadius="14" Background="#E6101419" BorderBrush="#55FF5050" BorderThickness="1.5" Visibility="Collapsed">
-      <StackPanel>
-        <Border x:Name="PanelHeader" CornerRadius="12,12,0,0" Background="#221A1E2A" Padding="12,10,8,10">
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-              <TextBlock x:Name="TallyLight" Text="●" FontSize="20" Foreground="#555" Margin="0,0,8,0" VerticalAlignment="Center"/>
-              <TextBlock x:Name="IndicatorText" Text="STANDBY" FontSize="22" FontWeight="Bold" Foreground="#555" VerticalAlignment="Center" FontFamily="Consolas"/>
-              <TextBlock x:Name="SessionCount" Text="" FontSize="12" Foreground="#999" Margin="8,0,0,0" VerticalAlignment="Center"/>
-            </StackPanel>
-            <StackPanel Grid.Column="1" Orientation="Horizontal">
-              <Button x:Name="BtnAuto" Content="自动继续" FontSize="11" Height="24" Padding="8,0" Margin="0,0,6,0"
-                      Background="#22FFFFFF" Foreground="#CCC" BorderThickness="1" BorderBrush="#44FFFFFF" Cursor="Hand"/>
-              <Button x:Name="BtnCollapse" Content="–" FontSize="12" Width="24" Height="24" Padding="0" Margin="0,0,6,0"
-                      Background="#22FFFFFF" Foreground="#CCC" BorderThickness="1" BorderBrush="#44FFFFFF" Cursor="Hand"/>
-              <Button x:Name="BtnClose" Content="✕" FontSize="12" Width="24" Height="24" Padding="0"
-                      Background="#33FF5050" Foreground="#FF9A9A" BorderThickness="0" Cursor="Hand"/>
-            </StackPanel>
-          </Grid>
-          <Border.Style><Style><Setter Property="Border.Cursor" Value="SizeAll"/></Style></Border.Style>
-        </Border>
-        <Border x:Name="AlertBar" Background="#22FF5050" Padding="10,6" Visibility="Collapsed">
-          <TextBlock x:Name="AlertText" Text="" FontSize="12" Foreground="#FFD0D0" TextWrapping="Wrap" MaxHeight="44"/>
-        </Border>
-        <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="380">
-          <StackPanel x:Name="SessionList" Margin="8" />
-        </ScrollViewer>
-        <TextBlock x:Name="EmptyText" Text="暂无进行中的会话。会话进入「活动中」会显示 ON AIR。" FontSize="12" Foreground="#777" Margin="12,4" TextWrapping="Wrap"/>
-        <Border BorderThickness="0,1,0,0" BorderBrush="#33FFFFFF" Padding="10,6">
-          <TextBlock x:Name="Foot" FontSize="11" Foreground="#888"/>
-        </Border>
-      </StackPanel>
-    </Border>
-  </Grid>
-</Window>
-'@
+$xaml = Get-Content -LiteralPath (Join-Path $PSScriptRoot "onair-widget.xaml") -Raw -Encoding UTF8
 
 [xml]$xamlDoc = $xaml
 $reader = New-Object System.Xml.XmlNodeReader $xamlDoc
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
+Add-Type -Path (Join-Path $PSScriptRoot "glass-window.cs") -ReferencedAssemblies @("PresentationFramework", "PresentationCore", "WindowsBase")
+[DshOnAir.GlassWindow]::Attach($window)
 if ($null -eq $window) {
   Write-Error 'XAML 加载失败（XamlReader.Load 返回 null），桌面件无法启动'
   exit 1
@@ -119,9 +57,9 @@ function Set-WindowSize {
   if ($script:expanded) {
     $right = $window.Left + $window.Width
     $bottom = $window.Top + $window.Height
-    $window.Width = 380; $window.Height = 560
-    $window.Left = [Math]::Max(0, $right - 380)
-    $window.Top = [Math]::Max(0, $bottom - 560)
+    $window.Width = 400; $window.Height = 520
+    $window.Left = [Math]::Max(0, $right - 400)
+    $window.Top = [Math]::Max(0, $bottom - 520)
   } else {
     $right = $window.Left + $window.Width
     $bottom = $window.Top + $window.Height
@@ -156,10 +94,14 @@ function Apply-Indicator($stateText, $hex) {
 function Update-UI($state) {
   if (-not $state) {
     Apply-Indicator 'OFFLINE' '#FF7050'
+    $btnAuto.IsEnabled = $false
     $script:offline = $true
     $foot.Text = "主机监控离线（$api 无响应）"
     return
   }
+  if (-not $state.instance.id -or ($script:instanceId -and $state.instance.id -ne $script:instanceId)) { $btnAuto.IsEnabled = $false; $foot.Text = "宿主身份不匹配，请重新打开"; return }
+  $script:instanceId = $state.instance.id
+  $btnAuto.IsEnabled = $true
   $script:offline = $false
   $script:autoRetry = [bool]$state.settings.autoRetry
   Update-AutoButton
@@ -177,13 +119,15 @@ function Update-UI($state) {
 
   # 演播室指示标：429 > 等待 > ON AIR > DONE > STANDBY
   $any429  = $sessions | Where-Object { $_.state -eq 'error429' } | Select-Object -First 1
+  $anyError = $sessions | Where-Object { $_.state -eq 'error' } | Select-Object -First 1
   $anyWait = $sessions | Where-Object { $_.state -eq 'waiting-answer' -or $_.state -eq 'waiting-approval' } | Select-Object -First 1
   $anyAct  = $sessions | Where-Object { $_.state -eq 'active' } | Select-Object -First 1
   $anyDone = $sessions | Where-Object { $_.state -eq 'complete' } | Select-Object -First 1
-  if ($any429) { Apply-Indicator '429' '#FF2A2A' }
-  elseif ($anyWait) { Apply-Indicator 'WAITING' '#4DA6FF' }
-  elseif ($anyAct) { Apply-Indicator 'ON AIR' '#FF3B30' }
-  elseif ($anyDone) { Apply-Indicator 'DONE' '#F5A623' }
+  if ($any429) { Apply-Indicator '429' '#FDA4AF' }
+  elseif ($anyError) { Apply-Indicator 'ERROR' '#FDA4AF' }
+  elseif ($anyWait) { Apply-Indicator 'WAITING' '#93C5FD' }
+  elseif ($anyAct) { Apply-Indicator 'ON AIR' '#6EE7B7' }
+  elseif ($anyDone) { Apply-Indicator 'DONE' '#C4B5FD' }
   else { Apply-Indicator 'STANDBY' '#666' }
 
   # 告警横幅（最新 429/报错）
@@ -202,21 +146,27 @@ function Update-UI($state) {
   $list.Children.Clear()
   foreach ($s in $sessions) {
     $row = New-Object System.Windows.Controls.Border
-    $row.Margin = New-Object System.Windows.Thickness(0, 2, 0, 2)
-    $row.Background = Set-Font '#22FFFFFF'
-    $row.CornerRadius = New-Object System.Windows.CornerRadius(8)
-    $row.Padding = New-Object System.Windows.Thickness(8, 6, 8, 6)
+    $row.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+    $row.Background = Set-Font '#0EBDD0FF'
+    $row.BorderBrush = Set-Font '#20BDD0FF'
+    $row.BorderThickness = New-Object System.Windows.Thickness(1)
+    $row.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $row.Padding = New-Object System.Windows.Thickness(12)
     $col = New-Object System.Windows.Controls.StackPanel
     $title = New-Object System.Windows.Controls.TextBlock
     $shortCwd = Short-Cwd $s.cwd
-    $title.Text = "$($s.title) - $shortCwd"
-    $title.FontSize = 12.5; $title.FontWeight = 'Bold'; $title.Foreground = Set-Font '#E8E8E8'
+    $title.Text = $s.title
+    $pathText = New-Object System.Windows.Controls.TextBlock
+    $pathText.Text = $shortCwd; $pathText.FontSize = 11; $pathText.Foreground = Set-Font "#AAB8D2"
+    $pathText.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+    $pathText.TextTrimming = "CharacterEllipsis"
+    $title.FontSize = 12.5; $title.FontWeight = 'SemiBold'; $title.Foreground = Set-Font '#E8EEFB'
     $title.TextTrimming = 'CharacterEllipsis'
     $meta = New-Object System.Windows.Controls.TextBlock
     $act = if ($s.state -eq 'active' -and $s.activeSince) { "已持续 " + (Format-Elapsed $s.activeSince) } else { Format-Time $s.lastActivity }
     $meta.Text = "[$($s.stateText)] · $act · 自动继续 $($s.retries)次"
-    $meta.FontSize = 11; $meta.Foreground = Set-Font '#999'; $meta.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
-    [void]$col.Children.Add($title); [void]$col.Children.Add($meta)
+    $meta.FontSize = 11; $meta.Foreground = Set-Font '#AAB8D2'; $meta.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
+    [void]$col.Children.Add($title); [void]$col.Children.Add($pathText); [void]$col.Children.Add($meta)
     $row.Child = $col
     [void]$list.Children.Add($row)
   }
@@ -247,8 +197,8 @@ function Format-Time($ts) {
 }
 
 function Update-AutoButton {
-  $btnAuto.Background = if ($script:autoRetry) { Set-Font '#33FF5050' } else { Set-Font '#22FFFFFF' }
-  $btnAuto.Foreground = if ($script:autoRetry) { Set-Font '#FFB0B0' } else { Set-Font '#CCC' }
+  $btnAuto.Background = if ($script:autoRetry) { Set-Font '#257598F1' } else { Set-Font '#22FFFFFF' }
+  $btnAuto.Foreground = if ($script:autoRetry) { Set-Font '#BDD0FF' } else { Set-Font '#DCE6FA' }
   $btnAuto.Content = if ($script:autoRetry) { '自动继续: 开' } else { '自动继续: 关' }
 }
 
@@ -301,12 +251,16 @@ $capsule.Add_MouseLeftButtonUp({
   $script:dragging = $false
 })
 $btnAuto.Add_Click({
-  $script:autoRetry = -not $script:autoRetry
-  Update-AutoButton
+  if (-not $script:instanceId) { return }
+  $btnAuto.IsEnabled = $false
   try {
-    $body = @{ autoRetry = [bool]$script:autoRetry } | ConvertTo-Json -Compress
-    Invoke-RestMethod -Uri "$api/api/settings" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null
-  } catch { }
+    $next = -not $script:autoRetry
+    $body = @{ autoRetry = $next } | ConvertTo-Json -Compress
+    $result = Invoke-RestMethod -Uri "$api/api/settings" -Method Post -Body $body -Headers @{ 'X-DSH-Monitor-Instance' = $script:instanceId } -ContentType 'application/json' -TimeoutSec 3 -ErrorAction Stop
+    if (-not $result.ok -or $result.instance.id -ne $script:instanceId) { throw '设置未确认' }
+    $script:autoRetry = [bool]$result.settings.autoRetry
+    Update-AutoButton
+  } catch { $foot.Text = '设置保存失败，请重试' }
 })
 $panelHeader.Add_MouseLeftButtonDown({ if ($_.ButtonState -eq 'Pressed') { try { $window.DragMove() } catch { } } })
 

@@ -1,0 +1,75 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DSH Monitor" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" Width="180" Height="44"
+        FontFamily="Segoe UI, Microsoft YaHei UI" WindowStartupLocation="Manual" UseLayoutRounding="True">
+  <Window.Resources>
+    <LinearGradientBrush x:Key="Glass" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#D92B3755" Offset="0"/><GradientStop Color="#D9162038" Offset="1"/>
+    </LinearGradientBrush>
+    <Style TargetType="Button">
+      <Setter Property="Foreground" Value="#DCE6FA"/><Setter Property="Background" Value="#12BDD0FF"/>
+      <Setter Property="BorderBrush" Value="#2DBDD0FF"/><Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="10,5"/><Setter Property="FontSize" Value="11"/>
+      <Setter Property="MinHeight" Value="28"/><Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="#30BDD0FF"/></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="#A0BDFF"/></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.7"/></Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Chrome" Property="Opacity" Value="0.4"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Border x:Name="Capsule" CornerRadius="20" Background="{StaticResource Glass}" BorderBrush="#45BDD0FF" BorderThickness="1"
+            Cursor="Hand" Padding="14,0" Height="44">
+      <Border.Effect><DropShadowEffect x:Name="CapGlow" Color="#859AF5" BlurRadius="12" ShadowDepth="0" Opacity="0.2"/></Border.Effect>
+      <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <Ellipse x:Name="CapDot" Width="7" Height="7" Fill="#6EE7B7" VerticalAlignment="Center" Margin="0,0,10,0">
+          <Ellipse.Effect><DropShadowEffect x:Name="CapDotGlow" Color="#6EE7B7" BlurRadius="7" ShadowDepth="0" Opacity="0.4"/></Ellipse.Effect>
+        </Ellipse>
+        <TextBlock Grid.Column="1" x:Name="CapText" Text="STANDBY" FontSize="12" FontWeight="SemiBold" Foreground="#AAB8D2" VerticalAlignment="Center"/>
+        <TextBlock Grid.Column="2" x:Name="CapCount" Foreground="#AAB8D2" FontSize="11" Margin="8,0" VerticalAlignment="Center"/>
+        <Button Grid.Column="3" x:Name="CapClose" Content="&#x00D7;" ToolTip="关闭桌面件" Width="20" Height="20" MinHeight="20" Padding="0" Background="Transparent" BorderThickness="0" Foreground="#AAB8D2"/>
+      </Grid>
+    </Border>
+    <Border x:Name="Panel" CornerRadius="20" Background="{StaticResource Glass}" BorderBrush="#45BDD0FF" BorderThickness="1" Visibility="Collapsed">
+      <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Border x:Name="PanelHeader" CornerRadius="19,19,0,0" Background="#0FBDD0FF" Padding="18,16" Cursor="SizeAll">
+          <Grid>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel><TextBlock Text="DSH MONITOR" FontSize="10" Foreground="#A3B8E4" Margin="0,0,0,8"/>
+              <StackPanel Orientation="Horizontal"><TextBlock x:Name="TallyLight" Text="&#x25CF;" FontSize="12" Foreground="#AAB8D2" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                <TextBlock x:Name="IndicatorText" Text="STANDBY" FontSize="22" FontWeight="SemiBold" Foreground="#AAB8D2"/>
+              </StackPanel>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+              <Button x:Name="BtnCollapse" Content="&#x2013;" ToolTip="收起为胶囊" Width="28" Padding="0" Margin="0,0,6,0"/>
+              <Button x:Name="BtnClose" Content="&#x00D7;" ToolTip="关闭桌面件" Width="28" Padding="0" Foreground="#FDA4AF"/>
+            </StackPanel>
+            <TextBlock Grid.Row="1" x:Name="SessionCount" Text="等待连接" FontSize="12" Foreground="#AAB8D2" Margin="0,14,0,0" VerticalAlignment="Center"/>
+            <Button Grid.Row="1" Grid.Column="1" x:Name="BtnAuto" Content="自动继续: 关" ToolTip="429 中断后向对应会话发送继续" Margin="0,12,0,0"/>
+          </Grid>
+        </Border>
+        <Border Grid.Row="1" x:Name="AlertBar" Background="#1FFB7185" BorderBrush="#40FB7185" BorderThickness="1" CornerRadius="10" Padding="12,10" Margin="14,10,14,0" Visibility="Collapsed">
+          <TextBlock x:Name="AlertText" FontSize="12" Foreground="#FDA4AF" TextWrapping="Wrap" MaxHeight="48"/>
+        </Border>
+        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="0,6">
+          <StackPanel x:Name="SessionList" Margin="14,4"/>
+        </ScrollViewer>
+        <TextBlock Grid.Row="3" x:Name="EmptyText" Text="暂无活动会话。新的会话会自动出现在这里。" FontSize="12" Foreground="#AAB8D2" Margin="18,8,18,20" TextWrapping="Wrap"/>
+        <Border Grid.Row="4" BorderThickness="0,1,0,0" BorderBrush="#20BDD0FF" Padding="18,12" Background="#150B122B" CornerRadius="0,0,19,19">
+          <TextBlock x:Name="Foot" FontSize="10" Foreground="#AAB8D2" TextWrapping="Wrap"/>
+        </Border>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

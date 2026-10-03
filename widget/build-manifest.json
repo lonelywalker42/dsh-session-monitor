@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "1.2.0",
+  "gitCommit": "f7c7d0a3f408ee5b978a7637ce1398e26e0279aa",
+  "sources": {
+    "onair-widget.cs": "64b93236435f1da9695d6afd8c596428bcdc45c93e9e4a6ae2db9f5c8029d5b7",
+    "glass-window.cs": "13da240afed7a287b14cdaa3a9d0169e0eb21be88ec930e8e887c8c2ce1e7a14",
+    "onair-widget.xaml": "0f41011b76681d2ce3752546697789bd3f398b1e40673876a74083cae769c9c0",
+    "onair-widget.ps1": "cf82b38e84fe663a2ab1f239da15ace7572fee03ad5813838cea47d1b8806448",
+    "build.mjs": "38032224ae4448bd3d9fae61f556e8ab82561686cc760554dbaf330f3952bd2c"
+  },
+  "exeSha256": "cfdc3f1801cc113318ba6241d4d8ae1a28c6f5731ed497266398c2110b01855c"
+}

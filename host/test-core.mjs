@@ -93,10 +93,14 @@ check('B: 无收到任何继续', core2.records.get('session-b') === undefined |
 
 // maxRetries 上限：手动把 retries 推到上限再触发新停止 → 不发
 recA.retries = 3
-core2.onSessionEvent('session-a', { type: 'turn/start', seq: 10 }, { settings })
-core2.onSessionEvent('session-a', { type: 'turn/end', data: { reason: { kind: 'error', error: { code: '429', message: 'rate' } } }, seq: 11 }, { settings })
-const before = sent.length
-check('A: 达到 maxRetries 后不再自动发', sent.length === before)
+core2.records.get('session-a').retries = settings.maxRetries;
+const before = sent.length;
+core2.onSessionEvent('session-a', { type: 'turn/end', data: { reason: { kind: 'error', error: { code: '429', message: 'rate' } } }, seq: 11 }, { settings });
+await tick();
+check('A: 达到 maxRetries 后不再自动发', sent.length === before);
+core2.records.get('session-a').retries = 0;
+check('监控关闭不自动继续', core2.maybeAutoContinue(core2.records.get('session-a'), 'turn:12', {...settings, monitoring:false}) === false);
+check('实时/折叠同一停止共用去重', core2.maybeAutoContinue(core2.records.get('session-a'), 'fold:2', settings) === false);
 
 // 关闭自动继续 → 不发
 const before3 = sent.length
