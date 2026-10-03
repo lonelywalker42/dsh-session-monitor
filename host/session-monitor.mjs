@@ -1373,9 +1373,29 @@ function applyInner(ctx, config) {
     killWidget()
   })
 
-  // ---- webui 设置页注入：会话监控 / ON AIR 桌面显示 开关 ----
+  // ---- 页面绑定注入：会话监控 / ON AIR 桌面显示 开关 ----
   // webServer 为可选依赖：通过 ctx.inject 等待；缺失时仅跳过设置页注入，不影响其他功能。
+  // 注入通道（关键）：结构化行 `webserver/index-inject` 同时覆盖 webui 与桌面端——
+  //  - webui：frontend-static 用 webServer.renderIndex()（= applyIndexTaps(renderIndexInjections(...))）
+  //    把结构化行渲染进服务端 HTML；
+  //  - 桌面端：Electron 窗口首页是从打包 dist 静态读取的（serveWebDocument，只注入 BOOT 脚本），
+  //    页面再通过 IPC boot 拿到 collectIndexInjections() 的结构化行，由 applyIndexInjections 逐行执行。
+  //  原来只用 webServer.tapIndex（原始 HTML 变换）时，该变换只在 webui 的 renderIndex 里生效，
+  //  桌面端页面永远收不到 → 客户端徽章在桌面端显示「未绑定宿主」。因此必须注册结构化行。
+  //  global 行把 JSON 值赋给 globalThis（浏览器里即 window），客户端在页面加载后读到。
   try {
+    const bindingRows = () => {
+      const base = 'http://127.0.0.1:' + (boundPort || PORT)
+      const binding = instance ? { api: base + '/api', id: instance.id, profile: instance.profile } : null
+      return [
+        { kind: 'global', name: '__DSH_MONITOR_BINDING__', value: binding },
+        { kind: 'global', name: '__DSH_MONITOR_API__', value: base + '/api' },
+      ]
+    }
+    ctx.on('webserver/index-inject', (table) => {
+      table.push(...bindingRows())
+    })
+    // 兼容 fallback：webui 直连宿主时仍走 tapIndex（幂等，重复注入相同值无害）。
     const injectSettingsPanel = (html) => {
       const base = 'http://127.0.0.1:' + (boundPort || PORT)
       return injectMonitorEndpoint(html, base, instance)

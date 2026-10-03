@@ -170,7 +170,7 @@ widget\onair-widget.bat 8092       :: 指定端口
   `session/event`（`turn/start`、`tool/call`、`tool/result`、`approval/asked`、`llm/retry`、`turn/end`）、
   `agent/inbox/spliced`
 - 服务：`ctx.sessions.list()`、`ctx.agents.get(id)`、`ctx.tools`、`ctx.webServer.tapIndex`、
-  `agent.followup(...)`
+  `webserver/index-inject`（结构化行注入，桌面端必需）、`agent.followup(...)`
 - 客户端：`window.__ModuleLoader__.load`、`slots.register('conversation.input.left')`、
   `ctx.locale.register`
 
@@ -224,6 +224,7 @@ node test/load-sim.mjs
 | `skipping profile bundle "dsh-429-monitor": Plugin ... is incompatible with dsh X` | 你的 DSH 版本与本包声明的版本不符。升级 DSH，或（明确知晓风险时）用 `dsh plugin allow-version` 放行 |
 | 仪表盘打不开 | 端口被占用会自动回退；看 dsh 主机日志里的 `监控仪表盘: http://127.0.0.1:<port>`。也可设 `SM_PORT` |
 | 输入栏没有状态徽章 | ① 是否已重启 DSH；② `package.json` 的 `dsh.client.platform` 是否为 `"web"`；③ 浏览器控制台是否有 `ClientPackageCompositionError`（同包多 source） |
+| 徽章显示「未绑定宿主」 | 宿主需 ≥ 1.2.1（注册 `webserver/index-inject` 结构化行）。重启桌面应用后页面会自动拿到 binding；若仍显示，按 F12 看 `window.__DSH_MONITOR_BINDING__` 是否存在 |
 | `ClientPackageCompositionError: ... multiple active Loader sources` | 同一个包被注册了两行。删掉多余的那一行，只保留一行 |
 | ON AIR 小窗不出现 | 确认 `widget/onair-widget.exe` 存在；`desktopDisplay` 是否为 `true`；或手动跑 `widget\onair-widget.bat` |
 
@@ -232,6 +233,25 @@ node test/load-sim.mjs
 ## 许可证
 
 MIT
+
+## 1.2.1 桌面端「未绑定宿主」修复
+
+**现象**：v1.2.0 升级后，桌面端 GUI 里的状态徽章显示「未绑定宿主」，无法发送「继续」。
+
+**根因**：宿主把客户端绑定（API 地址、实例 ID、profile）注入页面的方式只有 `webServer.tapIndex`
+（原始 HTML 变换）。这套机制在 **webui** 有效——webui 的 index 页面由宿主 `frontend-static` 通过
+`webServer.renderIndex()` 渲染，tapIndex 变换会写进页面文本；但**桌面端不走这条路**：Electron 窗口的
+首页是从打包 dist 静态读取的（`serveWebDocument`，只注入 BOOT 脚本），页面再通过 IPC boot 拿到
+`collectIndexInjections()` 返回的**结构化行**（`webserver/index-inject`），由 `applyIndexInjections`
+逐行执行。只注册 tapIndex 时桌面端页面永远收不到 binding → 客户端 `monitorBinding()` 返回 null →
+徽章显示「未绑定宿主」。
+
+**修复**：宿主同时注册结构化行 `{ kind: 'global', name: '__DSH_MONITOR_BINDING__' | '__DSH_MONITOR_API__' }`
+（桌面端 IPC boot 与 webui 的 renderIndexInjections 都会消费），并保留 tapIndex 作为 webui 兼容 fallback
+（幂等，重复注入相同值无害）。修复后无需任何手工「绑定」步骤：客户端在页面加载后从
+`globalThis.__DSH_MONITOR_BINDING__` 读到 { api, id, profile }，与宿主 `/api/state` 的 instance 一致即自动在线。
+
+**验证**：`test/index-inject.mjs` 断言两条通道注入相同 binding（结构化行必须存在、tapIndex 与其同值）。
 
 ## 1.2.0 实例绑定与暂存消息
 

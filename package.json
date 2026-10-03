@@ -1,6 +1,6 @@
 {
   "name": "dsh-429-monitor",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "会话状态监测 + 429 错误检测 + 自动继续 + ON AIR 桌面件 (DSH 插件，桌面版 / webui 双端)",
   "type": "module",
   "main": "lib/index.js",
